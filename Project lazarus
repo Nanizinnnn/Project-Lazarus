@@ -1,0 +1,668 @@
+--// PROJECT LAZARUS - AIMBOT + ESP v15
+--// Com UI Nativa + Minimize + Botões Clicáveis + Ajustes de Aimbot
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Camera = workspace.CurrentCamera
+local LocalPlayer = Players.LocalPlayer
+local UserInputService = game:GetService("UserInputService")
+
+--// CONFIGURAÇÕES
+local CONFIG = {
+    AimbotEnabled = false,
+    ESPEnabled = false,
+    AimbotSmoothing = 0.15,
+    AimbotSmoothingMin = 0.1,
+    AimbotSmoothingMax = 1.0,
+    ESPColor = Color3.new(0, 1, 0),
+    FOVRadius = 90,
+    WallCheckEnabled = true,
+    HeadOffsetY = -0.3,
+    HeadOffsetX = 0.0,
+    HeadOffsetZ = 0.0,
+    DynamicRecoil = false
+}
+
+local ESPDrawings = {}
+local FOVCircle = nil
+local ZombieFolder = nil
+local lastCameraPos = Vector3.new(0, 0, 0)
+local lastAimbotTarget = nil
+
+-- ✅ NOVO: Variáveis da UI
+local UIMinimized = false
+local MainUI = nil
+local UIContent = nil
+local AimbotStatusLabel = nil
+local AimbotButton = nil
+local ESPStatusLabel = nil
+local ESPButton = nil
+local FOVInput = nil
+local SmoothingInput = nil
+local HeadOffsetInput = nil
+
+--// ════════════════════════════════════════
+--// ENCONTRAR ZOMBIES
+--// ════════════════════════════════════════
+
+local function FindZombieFolder()
+    local function searchDeep(parent, depth)
+        if depth > 5 then return nil end
+        
+        for _, child in ipairs(parent:GetChildren()) do
+            if child:IsA("Model") and child:FindFirstChildOfClass("Humanoid") then
+                local isPlayer = false
+                for _, player in ipairs(Players:GetPlayers()) do
+                    if player.Character == child then
+                        isPlayer = true
+                        break
+                    end
+                end
+                
+                if not isPlayer then
+                    return parent
+                end
+            end
+            
+            if child:IsA("Folder") or child:IsA("Model") then
+                local result = searchDeep(child, depth + 1)
+                if result then return result end
+            end
+        end
+        
+        return nil
+    end
+    
+    local result = searchDeep(workspace, 0)
+    return result
+end
+
+ZombieFolder = FindZombieFolder()
+
+--// ════════════════════════════════════════
+--// WALLCHECK
+--// ════════════════════════════════════════
+
+local function IsVisible(targetHead)
+    if not CONFIG.WallCheckEnabled then return true end
+    if not LocalPlayer.Character then return false end
+    
+    local origin = Camera.CFrame.Position
+    local direction = (targetHead.Position - origin)
+    local distance = direction.Magnitude
+    
+    if distance < 0.1 then return true end
+    
+    local raycastParams = RaycastParams.new()
+    raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+    raycastParams.FilterDescendantsInstances = {LocalPlayer.Character}
+    
+    local result = workspace:Raycast(origin, direction.Unit * distance, raycastParams)
+    
+    if result then
+        local hitModel = result.Instance:FindFirstAncestorWhichIsA("Model")
+        return hitModel == targetHead.Parent
+    end
+    
+    return true
+end
+
+--// ════════════════════════════════════════
+--// FUNÇÕES AUXILIARES
+--// ════════════════════════════════════════
+
+local function IsZombieAlive(zombie)
+    if not zombie or not zombie.Parent then return false end
+    
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player.Character == zombie then
+            return false
+        end
+    end
+    
+    local humanoid = zombie:FindFirstChildOfClass("Humanoid")
+    return humanoid and humanoid.Health > 0
+end
+
+local function GetAllZombies()
+    if not ZombieFolder then return {} end
+    
+    local zombies = {}
+    for _, child in ipairs(ZombieFolder:GetChildren()) do
+        if IsZombieAlive(child) then
+            table.insert(zombies, child)
+        end
+    end
+    
+    return zombies
+end
+
+--// ════════════════════════════════════════
+--// GET NEAREST ZOMBIE POR DISTÂNCIA (CORRIGIDO)
+--// ════════════════════════════════════════
+
+local function GetNearestZombieInFOV()
+    local zombies = GetAllZombies()
+    if #zombies == 0 then return nil end
+    
+    local nearestZombie = nil
+    local nearestDistance = math.huge
+    local screenCenter = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+    local playerPos = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    
+    if not playerPos then return nil end
+    
+    for _, zombie in ipairs(zombies) do
+        local head = zombie:FindFirstChild("Head") or zombie:FindFirstChild("HumanoidRootPart")
+        
+        if head then
+            local screenPos, onScreen = Camera:WorldToViewportPoint(head.Position)
+            
+            if onScreen and screenPos.Z > 0 then
+                -- ✅ CORRIGIDO: Usar distância 3D do jogador, não apenas screen
+                local worldDistance = (head.Position - playerPos.Position).Magnitude
+                local screenDistance = (Vector2.new(screenPos.X, screenPos.Y) - screenCenter).Magnitude
+                
+                -- ✅ Se está no FOV E é o mais perto
+                if screenDistance < CONFIG.FOVRadius and worldDistance < nearestDistance then
+                    if IsVisible(head) then
+                        nearestDistance = worldDistance
+                        nearestZombie = zombie
+                    end
+                end
+            end
+        end
+    end
+    
+    return nearestZombie
+end
+
+--// ════════════════════════════════════════
+--// FOV CIRCLE
+--// ════════════════════════════════════════
+
+local function CreateFOVCircle()
+    if FOVCircle then
+        pcall(function() FOVCircle:Remove() end)
+    end
+    
+    FOVCircle = Drawing.new("Circle")
+    FOVCircle.Radius = CONFIG.FOVRadius
+    FOVCircle.Color = Color3.new(1, 1, 1)
+    FOVCircle.Thickness = 2
+    FOVCircle.Filled = false
+    FOVCircle.Transparency = 0.7
+    FOVCircle.Visible = CONFIG.AimbotEnabled
+end
+
+local function UpdateFOVCircle()
+    if not FOVCircle then return end
+    
+    local screenSize = Camera.ViewportSize
+    FOVCircle.Position = Vector2.new(screenSize.X / 2, screenSize.Y / 2)
+    FOVCircle.Radius = CONFIG.FOVRadius
+    FOVCircle.Visible = CONFIG.AimbotEnabled
+end
+
+--// ════════════════════════════════════════
+--// AIMBOT (CORRIGIDO)
+--// ════════════════════════════════════════
+
+local aimbotLoop
+local function StartAimbot()
+    if aimbotLoop then aimbotLoop:Disconnect() end
+    
+    CreateFOVCircle()
+    
+    aimbotLoop = RunService.RenderStepped:Connect(function()
+        if not CONFIG.AimbotEnabled or not ZombieFolder then return end
+        
+        UpdateFOVCircle()
+        
+        local targetZombie = GetNearestZombieInFOV()
+        if not targetZombie then 
+            lastAimbotTarget = nil
+            return 
+        end
+        
+        local head = targetZombie:FindFirstChild("Head") or targetZombie:FindFirstChild("HumanoidRootPart")
+        if not head then return end
+        
+        -- ✅ CORRIGIDO: HeadOffsetY agora em -0.3 por padrão (mais pra baixo)
+        local targetPos = head.Position + Vector3.new(
+            CONFIG.HeadOffsetX,
+            CONFIG.HeadOffsetY,
+            CONFIG.HeadOffsetZ
+        )
+        
+        local currentCFrame = Camera.CFrame
+        local newCFrame = CFrame.new(currentCFrame.Position, targetPos)
+        
+        Camera.CFrame = currentCFrame:Lerp(newCFrame, CONFIG.AimbotSmoothing)
+        
+        lastAimbotTarget = targetZombie
+    end)
+end
+
+local function StopAimbot()
+    if aimbotLoop then
+        aimbotLoop:Disconnect()
+        aimbotLoop = nil
+    end
+    
+    if FOVCircle then
+        pcall(function() FOVCircle:Remove() end)
+        FOVCircle = nil
+    end
+    
+    lastAimbotTarget = nil
+end
+
+--// ════════════════════════════════════════
+--// ESP
+--// ════════════════════════════════════════
+
+local lastCleanTime = 0
+
+local function CleanESP()
+    for _, drawing in ipairs(ESPDrawings) do
+        pcall(function() drawing:Remove() end)
+    end
+    ESPDrawings = {}
+end
+
+local function UpdateESP()
+    if not CONFIG.ESPEnabled or not ZombieFolder then return end
+    
+    lastCleanTime = lastCleanTime + 1
+    if lastCleanTime >= 2 then
+        CleanESP()
+        lastCleanTime = 0
+    else
+        return
+    end
+    
+    local zombies = GetAllZombies()
+    
+    for _, zombie in ipairs(zombies) do
+        local torso = zombie:FindFirstChild("Torso") or zombie:FindFirstChild("HumanoidRootPart")
+        
+        if torso then
+            local screenPos, onScreen = Camera:WorldToViewportPoint(torso.Position)
+            
+            if onScreen and screenPos.Z > 0 then
+                local circle = Drawing.new("Circle")
+                circle.Position = Vector2.new(screenPos.X, screenPos.Y)
+                circle.Radius = 8
+                circle.Color = CONFIG.ESPColor
+                circle.Thickness = 2
+                circle.Filled = false
+                circle.Transparency = 0.8
+                circle.Visible = true
+                
+                table.insert(ESPDrawings, circle)
+            end
+        end
+    end
+end
+
+local espLoop = RunService.RenderStepped:Connect(function()
+    if CONFIG.ESPEnabled then
+        UpdateESP()
+    end
+end)
+
+--// ════════════════════════════════════════
+--// UI NATIVA (COMPACTA)
+--// ════════════════════════════════════════
+
+local function UpdateUIStatus()
+    if AimbotStatusLabel then
+        AimbotStatusLabel.Text = CONFIG.AimbotEnabled and "ON" or "OFF"
+        AimbotStatusLabel.TextColor3 = CONFIG.AimbotEnabled and Color3.new(0, 1, 0) or Color3.new(1, 0, 0)
+    end
+    
+    if ESPStatusLabel then
+        ESPStatusLabel.Text = CONFIG.ESPEnabled and "ON" or "OFF"
+        ESPStatusLabel.TextColor3 = CONFIG.ESPEnabled and Color3.new(0, 1, 0) or Color3.new(1, 0, 0)
+    end
+end
+
+local function CreateUI()
+    -- ✅ ScreenGui
+    MainUI = Instance.new("ScreenGui")
+    MainUI.Name = "ProjectLazarusUI"
+    MainUI.Parent = game:GetService("CoreGui")
+    MainUI.ResetOnSpawn = false
+
+    -- ✅ Frame Principal (MENOR)
+    local MainFrame = Instance.new("Frame")
+    MainFrame.Name = "MainFrame"
+    MainFrame.Size = UDim2.new(0, 220, 0, 300)
+    MainFrame.Position = UDim2.new(0, 10, 0, 50)
+    MainFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+    MainFrame.BorderSizePixel = 2
+    MainFrame.BorderColor3 = Color3.fromRGB(30, 30, 30)
+    MainFrame.Draggable = true
+    MainFrame.Active = true
+    MainFrame.Parent = MainUI
+
+    -- ✅ Header
+    local Header = Instance.new("TextLabel")
+    Header.Size = UDim2.new(1, 0, 0, 28)
+    Header.Position = UDim2.new(0, 0, 0, 0)
+    Header.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+    Header.TextColor3 = Color3.fromRGB(255, 255, 255)
+    Header.Text = "LAZARUS"
+    Header.Font = Enum.Font.GothamBold
+    Header.TextSize = 10
+    Header.Parent = MainFrame
+
+    -- ✅ Minimize Button
+    local MinimizeBtn = Instance.new("TextButton")
+    MinimizeBtn.Size = UDim2.new(0, 25, 0, 28)
+    MinimizeBtn.Position = UDim2.new(1, -30, 0, 0)
+    MinimizeBtn.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+    MinimizeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    MinimizeBtn.Text = "−"
+    MinimizeBtn.Font = Enum.Font.GothamBold
+    MinimizeBtn.TextSize = 14
+    MinimizeBtn.Parent = MainFrame
+
+    -- ✅ Close Button
+    local CloseBtn = Instance.new("TextButton")
+    CloseBtn.Size = UDim2.new(0, 25, 0, 28)
+    CloseBtn.Position = UDim2.new(1, -5, 0, 0)
+    CloseBtn.BackgroundColor3 = Color3.fromRGB(255, 50, 50)
+    CloseBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    CloseBtn.Text = "X"
+    CloseBtn.Font = Enum.Font.GothamBold
+    CloseBtn.TextSize = 12
+    CloseBtn.Parent = MainFrame
+
+    -- ✅ Content Frame
+    UIContent = Instance.new("Frame")
+    UIContent.Size = UDim2.new(1, 0, 1, -28)
+    UIContent.Position = UDim2.new(0, 0, 0, 28)
+    UIContent.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+    UIContent.BorderSizePixel = 0
+    UIContent.Parent = MainFrame
+
+    -- ✅ ScrollingFrame
+    local ScrollFrame = Instance.new("ScrollingFrame")
+    ScrollFrame.Size = UDim2.new(1, 0, 1, 0)
+    ScrollFrame.BackgroundTransparency = 1
+    ScrollFrame.ScrollBarThickness = 3
+    ScrollFrame.CanvasSize = UDim2.new(0, 0, 0, 280)
+    ScrollFrame.Parent = UIContent
+
+    -- ✅ AIMBOT Label
+    local AimbotLabel = Instance.new("TextLabel")
+    AimbotLabel.Size = UDim2.new(0.5, 0, 0, 28)
+    AimbotLabel.Position = UDim2.new(0, 5, 0, 5)
+    AimbotLabel.BackgroundTransparency = 1
+    AimbotLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+    AimbotLabel.Text = "AIM (5)"
+    AimbotLabel.Font = Enum.Font.Gotham
+    AimbotLabel.TextSize = 9
+    AimbotLabel.TextXAlignment = Enum.TextXAlignment.Left
+    AimbotLabel.Parent = ScrollFrame
+
+    -- ✅ AIMBOT Button
+    AimbotButton = Instance.new("TextButton")
+    AimbotButton.Size = UDim2.new(0.35, 0, 0, 24)
+    AimbotButton.Position = UDim2.new(0.6, 0, 0, 7)
+    AimbotButton.BackgroundColor3 = Color3.fromRGB(1, 0, 0)
+    AimbotButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    AimbotButton.Text = "OFF"
+    AimbotButton.Font = Enum.Font.GothamBold
+    AimbotButton.TextSize = 9
+    AimbotButton.Parent = ScrollFrame
+
+    AimbotStatusLabel = AimbotButton
+
+    -- ✅ ESP Label
+    local ESPLabel = Instance.new("TextLabel")
+    ESPLabel.Size = UDim2.new(0.5, 0, 0, 28)
+    ESPLabel.Position = UDim2.new(0, 5, 0, 38)
+    ESPLabel.BackgroundTransparency = 1
+    ESPLabel.TextColor3 = Color3.fromRGB(100, 255, 100)
+    ESPLabel.Text = "ESP (6)"
+    ESPLabel.Font = Enum.Font.Gotham
+    ESPLabel.TextSize = 9
+    ESPLabel.TextXAlignment = Enum.TextXAlignment.Left
+    ESPLabel.Parent = ScrollFrame
+
+    -- ✅ ESP Button
+    ESPButton = Instance.new("TextButton")
+    ESPButton.Size = UDim2.new(0.35, 0, 0, 24)
+    ESPButton.Position = UDim2.new(0.6, 0, 0, 40)
+    ESPButton.BackgroundColor3 = Color3.fromRGB(1, 0, 0)
+    ESPButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    ESPButton.Text = "OFF"
+    ESPButton.Font = Enum.Font.GothamBold
+    ESPButton.TextSize = 9
+    ESPButton.Parent = ScrollFrame
+
+    ESPStatusLabel = ESPButton
+
+    -- ✅ FOV Label
+    local FOVLabel = Instance.new("TextLabel")
+    FOVLabel.Size = UDim2.new(1, -10, 0, 15)
+    FOVLabel.Position = UDim2.new(0, 5, 0, 70)
+    FOVLabel.BackgroundTransparency = 1
+    FOVLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    FOVLabel.Text = "FOV: " .. CONFIG.FOVRadius
+    FOVLabel.Font = Enum.Font.Gotham
+    FOVLabel.TextSize = 8
+    FOVLabel.TextXAlignment = Enum.TextXAlignment.Left
+    FOVLabel.Parent = ScrollFrame
+
+    -- ✅ FOV Input
+    FOVInput = Instance.new("TextBox")
+    FOVInput.Size = UDim2.new(1, -10, 0, 20)
+    FOVInput.Position = UDim2.new(0, 5, 0, 87)
+    FOVInput.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+    FOVInput.TextColor3 = Color3.fromRGB(255, 255, 255)
+    FOVInput.Text = tostring(CONFIG.FOVRadius)
+    FOVInput.Font = Enum.Font.Gotham
+    FOVInput.TextSize = 9
+    FOVInput.PlaceholderText = "50-180"
+    FOVInput.Parent = ScrollFrame
+
+    -- ✅ Smoothing Label
+    local SmoothingLabel = Instance.new("TextLabel")
+    SmoothingLabel.Size = UDim2.new(1, -10, 0, 15)
+    SmoothingLabel.Position = UDim2.new(0, 5, 0, 115)
+    SmoothingLabel.BackgroundTransparency = 1
+    SmoothingLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    SmoothingLabel.Text = "Smooth: " .. string.format("%.2f", CONFIG.AimbotSmoothing)
+    SmoothingLabel.Font = Enum.Font.Gotham
+    SmoothingLabel.TextSize = 8
+    SmoothingLabel.TextXAlignment = Enum.TextXAlignment.Left
+    SmoothingLabel.Parent = ScrollFrame
+
+    -- ✅ Smoothing Input
+    SmoothingInput = Instance.new("TextBox")
+    SmoothingInput.Size = UDim2.new(1, -10, 0, 20)
+    SmoothingInput.Position = UDim2.new(0, 5, 0, 132)
+    SmoothingInput.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+    SmoothingInput.TextColor3 = Color3.fromRGB(255, 255, 255)
+    SmoothingInput.Text = string.format("%.2f", CONFIG.AimbotSmoothing)
+    SmoothingInput.Font = Enum.Font.Gotham
+    SmoothingInput.TextSize = 9
+    SmoothingInput.PlaceholderText = "0.1-1.0"
+    SmoothingInput.Parent = ScrollFrame
+
+    -- ✅ Head Offset Label
+    local HeadOffsetLabel = Instance.new("TextLabel")
+    HeadOffsetLabel.Size = UDim2.new(1, -10, 0, 15)
+    HeadOffsetLabel.Position = UDim2.new(0, 5, 0, 160)
+    HeadOffsetLabel.BackgroundTransparency = 1
+    HeadOffsetLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    HeadOffsetLabel.Text = "Offset: " .. string.format("%.1f", CONFIG.HeadOffsetY)
+    HeadOffsetLabel.Font = Enum.Font.Gotham
+    HeadOffsetLabel.TextSize = 8
+    HeadOffsetLabel.TextXAlignment = Enum.TextXAlignment.Left
+    HeadOffsetLabel.Parent = ScrollFrame
+
+    -- ✅ Head Offset Input
+    HeadOffsetInput = Instance.new("TextBox")
+    HeadOffsetInput.Size = UDim2.new(1, -10, 0, 20)
+    HeadOffsetInput.Position = UDim2.new(0, 5, 0, 177)
+    HeadOffsetInput.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+    HeadOffsetInput.TextColor3 = Color3.fromRGB(255, 255, 255)
+    HeadOffsetInput.Text = string.format("%.2f", CONFIG.HeadOffsetY)
+    HeadOffsetInput.Font = Enum.Font.Gotham
+    HeadOffsetInput.TextSize = 9
+    HeadOffsetInput.PlaceholderText = "-2 a 2"
+    HeadOffsetInput.Parent = ScrollFrame
+
+    -- ✅ Info Label
+    local InfoLabel = Instance.new("TextLabel")
+    InfoLabel.Size = UDim2.new(1, -10, 0, 50)
+    InfoLabel.Position = UDim2.new(0, 5, 0, 205)
+    InfoLabel.BackgroundTransparency = 1
+    InfoLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
+    InfoLabel.Text = "S: 0.1=Fast 1.0=Slow\nO: -=Down +=Up\nDefault: -0.3"
+    InfoLabel.Font = Enum.Font.Gotham
+    InfoLabel.TextSize = 7
+    InfoLabel.TextWrapped = true
+    InfoLabel.TextXAlignment = Enum.TextXAlignment.Left
+    InfoLabel.Parent = ScrollFrame
+
+    -- ✅ Minimize
+    MinimizeBtn.MouseButton1Click:Connect(function()
+        UIMinimized = not UIMinimized
+        UIContent.Visible = not UIMinimized
+        if UIMinimized then
+            MainFrame.Size = UDim2.new(0, 220, 0, 28)
+            MinimizeBtn.Text = "+"
+        else
+            MainFrame.Size = UDim2.new(0, 220, 0, 300)
+            MinimizeBtn.Text = "−"
+        end
+    end)
+
+    -- ✅ Close
+    CloseBtn.MouseButton1Click:Connect(function()
+        MainUI:Destroy()
+        StopAimbot()
+    end)
+
+    -- ✅ AIMBOT Button
+    AimbotButton.MouseButton1Click:Connect(function()
+        CONFIG.AimbotEnabled = not CONFIG.AimbotEnabled
+        
+        if CONFIG.AimbotEnabled then
+            if not ZombieFolder then
+                ZombieFolder = FindZombieFolder()
+            end
+            if ZombieFolder then
+                StartAimbot()
+            end
+        else
+            StopAimbot()
+        end
+        
+        UpdateUIStatus()
+    end)
+
+    -- ✅ ESP Button
+    ESPButton.MouseButton1Click:Connect(function()
+        CONFIG.ESPEnabled = not CONFIG.ESPEnabled
+        UpdateUIStatus()
+    end)
+
+    -- ✅ FOV Input
+    FOVInput.FocusLost:Connect(function()
+        local value = tonumber(FOVInput.Text)
+        if value then
+            value = math.clamp(value, 50, 180)
+            CONFIG.FOVRadius = value
+            FOVInput.Text = tostring(value)
+            FOVLabel.Text = "FOV: " .. CONFIG.FOVRadius
+            UpdateFOVCircle()
+        else
+            FOVInput.Text = tostring(CONFIG.FOVRadius)
+        end
+    end)
+
+    -- ✅ Smoothing Input
+    SmoothingInput.FocusLost:Connect(function()
+        local value = tonumber(SmoothingInput.Text)
+        if value then
+            value = math.clamp(value, 0.1, 1.0)
+            CONFIG.AimbotSmoothing = value
+            SmoothingInput.Text = string.format("%.2f", value)
+            SmoothingLabel.Text = "Smooth: " .. string.format("%.2f", CONFIG.AimbotSmoothing)
+        else
+            SmoothingInput.Text = string.format("%.2f", CONFIG.AimbotSmoothing)
+        end
+    end)
+
+    -- ✅ Head Offset Input
+    HeadOffsetInput.FocusLost:Connect(function()
+        local value = tonumber(HeadOffsetInput.Text)
+        if value then
+            value = math.clamp(value, -2.0, 2.0)
+            CONFIG.HeadOffsetY = value
+            HeadOffsetInput.Text = string.format("%.2f", value)
+            HeadOffsetLabel.Text = "Offset: " .. string.format("%.1f", CONFIG.HeadOffsetY)
+        else
+            HeadOffsetInput.Text = string.format("%.2f", CONFIG.HeadOffsetY)
+        end
+    end)
+
+    UpdateUIStatus()
+end
+
+CreateUI()
+
+--// ════════════════════════════════════════
+--// TECLADO
+--// ════════════════════════════════════════
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    
+    if input.KeyCode == Enum.KeyCode.Five then
+        CONFIG.AimbotEnabled = not CONFIG.AimbotEnabled
+        
+        if CONFIG.AimbotEnabled then
+            if not ZombieFolder then
+                ZombieFolder = FindZombieFolder()
+            end
+            if ZombieFolder then
+                StartAimbot()
+            end
+        else
+            StopAimbot()
+        end
+        
+        UpdateUIStatus()
+    end
+    
+    if input.KeyCode == Enum.KeyCode.Six then
+        CONFIG.ESPEnabled = not CONFIG.ESPEnabled
+        UpdateUIStatus()
+    end
+end)
+
+--// ════════════════════════════════════════
+--// INICIALIZAÇÃO
+--// ════════════════════════════════════════
+
+print("═══════════════════════════════════════")
+print("PROJECT LAZARUS v15.0 - FINAL")
+print("═══════════════════════════════════════")
+print("✓ Aimbot mira SEMPRE no zombie mais perto")
+print("✓ Head Offset padrão: -0.3 (mais baixo)")
+print("✓ UI Compacta criada!")
+print("═══════════════════════════════════════")
+
+if ZombieFolder then
+    print("✓ Pasta de Zombies encontrada!")
+else
+    print("✗ Pasta ainda não encontrada...")
+end
